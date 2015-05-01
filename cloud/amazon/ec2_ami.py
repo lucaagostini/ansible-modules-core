@@ -20,38 +20,33 @@ module: ec2_ami
 version_added: "1.3"
 short_description: create or destroy an image in ec2
 description:
-     - Creates or deletes ec2 images. 
+     - Creates or deletes ec2 images.
 options:
   instance_id:
     description:
       - instance id of the image to create
     required: false
     default: null
-    aliases: []
   name:
     description:
       - The name of the new image to create
     required: false
     default: null
-    aliases: []
   wait:
     description:
       - wait for the AMI to be in state 'available' before returning.
     required: false
     default: "no"
     choices: [ "yes", "no" ]
-    aliases: []
   wait_timeout:
     description:
       - how long before wait gives up, in seconds
     default: 300
-    aliases: []
   state:
     description:
       - create or deregister/delete image
     required: false
     default: 'present'
-    aliases: []
   region:
     description:
       - The AWS region to use.  Must be specified if ec2_url is not used. If not specified then the value of the EC2_REGION environment variable, if any, is used.
@@ -63,26 +58,28 @@ options:
       - An optional human-readable string describing the contents and purpose of the AMI.
     required: false
     default: null
-    aliases: []
   no_reboot:
     description:
       - An optional flag indicating that the bundling process should not attempt to shutdown the instance before bundling. If this flag is True, the responsibility of maintaining file system integrity is left to the owner of the instance. The default choice is "no".
     required: false
     default: no
     choices: [ "yes", "no" ]
-    aliases: []
   image_id:
     description:
       - Image ID to be deregistered.
     required: false
     default: null
-    aliases: []
   delete_snapshot:
     description:
       - Whether or not to delete an AMI while deregistering it.
     required: false
     default: null
-    aliases: []
+  tags:
+    description:
+      - a hash/dictionary of tags to add to the new image; '{"key":"value"}' and '{"key":"value","key":"value"}'
+    required: false
+    default: null
+    version_added: "2.0"
 
 author: Evan Duffield <eduffield@iacquire.com>
 extends_documentation_fragment: aws
@@ -98,6 +95,9 @@ EXAMPLES = '''
     instance_id: i-xxxxxx
     wait: yes
     name: newtest
+    tags:
+      Name: newtest
+      Service: TestService
   register: instance
 
 # Basic AMI Creation, without waiting
@@ -129,15 +129,17 @@ EXAMPLES = '''
     state: absent
 
 '''
+
 import sys
 import time
 
 try:
     import boto
     import boto.ec2
+    HAS_BOTO = True
 except ImportError:
-    print "failed=True msg='boto required for this module'"
-    sys.exit(1)
+    HAS_BOTO = False
+
 
 def create_image(module, ec2):
     """
@@ -153,6 +155,7 @@ def create_image(module, ec2):
     wait_timeout = int(module.params.get('wait_timeout'))
     description = module.params.get('description')
     no_reboot = module.params.get('no_reboot')
+    tags =  module.params.get('tags')
 
     try:
         params = {'instance_id': instance_id,
@@ -187,6 +190,12 @@ def create_image(module, ec2):
     if wait and wait_timeout <= time.time():
         # waiting took too long
         module.fail_json(msg = "timed out waiting for image to be created")
+
+    if tags:
+        try:
+            ec2.create_tags(image_id, tags)
+        except boto.exception.EC2ResponseError, e:
+            module.fail_json(msg = "Image tagging failed => %s: %s" % (e.error_code, e.error_message))
 
     module.exit_json(msg="AMI creation operation complete", image_id=image_id, state=img.state, changed=True)
 
@@ -226,6 +235,7 @@ def deregister_image(module, ec2):
     module.exit_json(msg="AMI deregister/delete operation complete", changed=True)
     sys.exit(0)
 
+
 def main():
     argument_spec = ec2_argument_spec()
     argument_spec.update(dict(
@@ -238,11 +248,19 @@ def main():
             description = dict(default=""),
             no_reboot = dict(default=False, type="bool"),
             state = dict(default='present'),
+            tags = dict(type='dict'),
+
         )
     )
     module = AnsibleModule(argument_spec=argument_spec)
 
-    ec2 = ec2_connect(module)
+    if not HAS_BOTO:
+        module.fail_json(msg='boto required for this module')
+
+    try:
+        ec2 = ec2_connect(module)
+    except Exception, e:
+        module.json_fail(msg="Error while connecting to aws: %s" % str(e))
 
     if module.params.get('state') == 'absent':
         if not module.params.get('image_id'):

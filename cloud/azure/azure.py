@@ -173,7 +173,20 @@ AZURE_ROLE_SIZES = ['ExtraSmall',
                     'Basic_A1',
                     'Basic_A2',
                     'Basic_A3',
-                    'Basic_A4']
+                    'Basic_A4',
+                    'Standard_D1',
+                    'Standard_D2',
+                    'Standard_D3',
+                    'Standard_D4',
+                    'Standard_D11',
+                    'Standard_D12',
+                    'Standard_D13',
+                    'Standard_D14',
+                    'Standard_G1',
+                    'Standard_G2',
+                    'Sandard_G3',
+                    'Standard_G4',
+                    'Standard_G5']
 
 try:
     import azure as windows_azure
@@ -229,7 +242,7 @@ def create_virtual_machine(module, azure):
     azure: authenticated azure ServiceManagementService object
 
     Returns:
-        True if a new virtual machine was created, false otherwise
+        True if a new virtual machine and/or cloud service was created, false otherwise
     """
     name = module.params.get('name')
     hostname = module.params.get('hostname') or name + ".cloudapp.net"
@@ -245,18 +258,24 @@ def create_virtual_machine(module, azure):
     wait = module.params.get('wait')
     wait_timeout = int(module.params.get('wait_timeout'))
 
+    changed = False
+
     # Check if a deployment with the same name already exists
     cloud_service_name_available = azure.check_hosted_service_name_availability(name)
-    if not cloud_service_name_available.result:
-        changed = False
-    else:
-        changed = True
-        # Create cloud service if necessary
+    if cloud_service_name_available.result:
+        # cloud service does not exist; create it
         try:
             result = azure.create_hosted_service(service_name=name, label=name, location=location)
             _wait_for_completion(azure, result, wait_timeout, "create_hosted_service")
+            changed = True
         except WindowsAzureError as e:
-            module.fail_json(msg="failed to create the new service name, it already exists: %s" % str(e))
+            module.fail_json(msg="failed to create the new service, error was: %s" % str(e))
+
+    try:
+        # check to see if a vm with this name exists; if so, do nothing
+        azure.get_role(name, name, name)
+    except WindowsAzureMissingResourceError:
+        # vm does not exist; create it
 
         # Create linux configuration
         disable_ssh_password_authentication = not password
@@ -281,6 +300,7 @@ def create_virtual_machine(module, azure):
         network_config = ConfigurationSetInputEndpoints()
         network_config.configuration_set_type = 'NetworkConfiguration'
         network_config.subnet_names = []
+        network_config.public_ips = None
         for port in endpoints:
             network_config.input_endpoints.append(ConfigurationSetInputEndpoint(name='TCP-%s' % port,
                                                                                 protocol='TCP',
@@ -308,9 +328,9 @@ def create_virtual_machine(module, azure):
                                                              role_type='PersistentVMRole',
                                                              virtual_network_name=virtual_network_name)
             _wait_for_completion(azure, result, wait_timeout, "create_virtual_machine_deployment")
+            changed = True
         except WindowsAzureError as e:
             module.fail_json(msg="failed to create the new virtual machine, error was: %s" % str(e))
-
 
     try:
         deployment = azure.get_deployment_by_name(service_name=name, deployment_name=name)
@@ -442,6 +462,8 @@ def main():
             module.fail_json(msg='location parameter is required for new instance')
         if not module.params.get('storage_account'):
             module.fail_json(msg='storage_account parameter is required for new instance')
+        if not module.params.get('password'):
+            module.fail_json(msg='password parameter is required for new instance')
         (changed, public_dns_name, deployment) = create_virtual_machine(module, azure)
 
     module.exit_json(changed=changed, public_dns_name=public_dns_name, deployment=json.loads(json.dumps(deployment, default=lambda o: o.__dict__)))

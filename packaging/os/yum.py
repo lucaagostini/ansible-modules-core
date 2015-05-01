@@ -25,6 +25,7 @@
 import traceback
 import os
 import yum
+import rpm
 
 try:
     from yum.misc import find_unfinished_transactions, find_ts_remaining
@@ -43,7 +44,7 @@ description:
 options:
   name:
     description:
-      - "Package name, or package specifier with version, like C(name-1.0). When using state=latest, this can be '*' which means run: yum -y update. You can also pass a url or a local path to a rpm file."
+      - "Package name, or package specifier with version, like C(name-1.0). When using state=latest, this can be '*' which means run: yum -y update. You can also pass a url or a local path to a rpm file.  To operate on several packages this can accept a comma separated list of packages or (as of 2.0) a list of packages."
     required: true
     default: null
     aliases: []
@@ -67,7 +68,7 @@ options:
     version_added: "0.9"
     default: null
     aliases: []
-    
+
   disablerepo:
     description:
       - I(Repoid) of repositories to disable for the install/update operation.
@@ -108,7 +109,7 @@ options:
 
 notes: []
 # informational: requirements for nodes
-requirements: [ yum, rpm ]
+requirements: [ yum ]
 author: Seth Vidal
 '''
 
@@ -121,6 +122,9 @@ EXAMPLES = '''
 
 - name: install the latest version of Apache from the testing repo
   yum: name=httpd enablerepo=testing state=present
+
+- name: install one specific version of Apache
+  yum: name=httpd-2.2.29-1.4.amzn1 state=present
 
 - name: upgrade all packages
   yum: name=* state=latest
@@ -149,21 +153,13 @@ def log(msg):
     syslog.openlog('ansible-yum', 0, syslog.LOG_USER)
     syslog.syslog(syslog.LOG_NOTICE, msg)
 
-def yum_base(conf_file=None, cachedir=False):
+def yum_base(conf_file=None):
 
     my = yum.YumBase()
     my.preconf.debuglevel=0
     my.preconf.errorlevel=0
     if conf_file and os.path.exists(conf_file):
         my.preconf.fn = conf_file
-    if cachedir or os.geteuid() != 0:
-        if hasattr(my, 'setCacheDir'):
-            my.setCacheDir()
-        else:
-            cachedir = yum.misc.getCacheDir()
-            my.repos.setCacheDir(cachedir)
-            my.conf.cache = 0 
-
     return my
 
 def install_yum_utils(module):
@@ -191,10 +187,10 @@ def is_installed(module, repoq, pkgspec, conf_file, qf=def_qf, en_repos=[], dis_
         pkgs = []
         try:
             my = yum_base(conf_file)
-            for rid in en_repos:
-                my.repos.enableRepo(rid)
             for rid in dis_repos:
                 my.repos.disableRepo(rid)
+            for rid in en_repos:
+                my.repos.enableRepo(rid)
                 
             e,m,u = my.rpmdb.matchPackageNames([pkgspec])
             pkgs = e + m
@@ -230,10 +226,10 @@ def is_available(module, repoq, pkgspec, conf_file, qf=def_qf, en_repos=[], dis_
         pkgs = []
         try:
             my = yum_base(conf_file)
-            for rid in en_repos:
-                my.repos.enableRepo(rid)
             for rid in dis_repos:
                 my.repos.disableRepo(rid)
+            for rid in en_repos:
+                my.repos.enableRepo(rid)
 
             e,m,u = my.pkgSack.matchPackageNames([pkgspec])
             pkgs = e + m
@@ -247,13 +243,11 @@ def is_available(module, repoq, pkgspec, conf_file, qf=def_qf, en_repos=[], dis_
     else:
         myrepoq = list(repoq)
                  
-        for repoid in dis_repos:
-            r_cmd = ['--disablerepo', repoid]
-            myrepoq.extend(r_cmd)
+        r_cmd = ['--disablerepo', ','.join(dis_repos)]
+        myrepoq.extend(r_cmd)
 
-        for repoid in en_repos:
-            r_cmd = ['--enablerepo', repoid]
-            myrepoq.extend(r_cmd)
+        r_cmd = ['--enablerepo', ','.join(en_repos)]
+        myrepoq.extend(r_cmd)
 
         cmd = myrepoq + ["--qf", qf, pkgspec]
         rc,out,err = module.run_command(cmd)
@@ -275,10 +269,10 @@ def is_update(module, repoq, pkgspec, conf_file, qf=def_qf, en_repos=[], dis_rep
 
         try:
             my = yum_base(conf_file)
-            for rid in en_repos:
-                my.repos.enableRepo(rid)
             for rid in dis_repos:
                 my.repos.disableRepo(rid)
+            for rid in en_repos:
+                my.repos.enableRepo(rid)
 
             pkgs = my.returnPackagesByDep(pkgspec) + my.returnInstalledPackagesByDep(pkgspec)
             if not pkgs:
@@ -296,13 +290,11 @@ def is_update(module, repoq, pkgspec, conf_file, qf=def_qf, en_repos=[], dis_rep
 
     else:
         myrepoq = list(repoq)
-        for repoid in dis_repos:
-            r_cmd = ['--disablerepo', repoid]
-            myrepoq.extend(r_cmd)
+        r_cmd = ['--disablerepo', ','.join(dis_repos)]
+        myrepoq.extend(r_cmd)
 
-        for repoid in en_repos:
-            r_cmd = ['--enablerepo', repoid]
-            myrepoq.extend(r_cmd)
+        r_cmd = ['--enablerepo', ','.join(en_repos)]
+        myrepoq.extend(r_cmd)
 
         cmd = myrepoq + ["--pkgnarrow=updates", "--qf", qf, pkgspec]
         rc,out,err = module.run_command(cmd)
@@ -321,10 +313,10 @@ def what_provides(module, repoq, req_spec, conf_file,  qf=def_qf, en_repos=[], d
         pkgs = []
         try:
             my = yum_base(conf_file)
-            for rid in en_repos:
-                my.repos.enableRepo(rid)
             for rid in dis_repos:
                 my.repos.disableRepo(rid)
+            for rid in en_repos:
+                my.repos.enableRepo(rid)
 
             pkgs = my.returnPackagesByDep(req_spec) + my.returnInstalledPackagesByDep(req_spec)
             if not pkgs:
@@ -341,13 +333,11 @@ def what_provides(module, repoq, req_spec, conf_file,  qf=def_qf, en_repos=[], d
 
     else:
         myrepoq = list(repoq)
-        for repoid in dis_repos:
-            r_cmd = ['--disablerepo', repoid]
-            myrepoq.extend(r_cmd)
+        r_cmd = ['--disablerepo', ','.join(dis_repos)]
+        myrepoq.extend(r_cmd)
 
-        for repoid in en_repos:
-            r_cmd = ['--enablerepo', repoid]
-            myrepoq.extend(r_cmd)
+        r_cmd = ['--enablerepo', ','.join(en_repos)]
+        myrepoq.extend(r_cmd)
 
         cmd = myrepoq + ["--qf", qf, "--whatprovides", req_spec]
         rc,out,err = module.run_command(cmd)
@@ -405,14 +395,19 @@ def transaction_exists(pkglist):
 
 def local_nvra(module, path):
     """return nvra of a local rpm passed in"""
-    
-    cmd = ['/bin/rpm', '-qp' ,'--qf', 
-            '%{name}-%{version}-%{release}.%{arch}\n', path ]
-    rc, out, err = module.run_command(cmd)
-    if rc != 0:
-        return None
-    nvra = out.split('\n')[0]
-    return nvra
+
+    ts = rpm.TransactionSet()
+    ts.setVSFlags(rpm._RPMVSF_NOSIGNATURES)
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        header = ts.hdrFromFdno(fd)
+    finally:
+        os.close(fd)
+
+    return '%s-%s-%s.%s' % (header[rpm.RPMTAG_NAME], 
+                            header[rpm.RPMTAG_VERSION],
+                            header[rpm.RPMTAG_RELEASE],
+                            header[rpm.RPMTAG_ARCH])
     
 def pkg_to_dict(pkgstr):
 
@@ -450,7 +445,7 @@ def repolist(module, repoq, qf="%{repoid}"):
 def list_stuff(module, conf_file, stuff):
 
     qf = "%{name}|%{epoch}|%{version}|%{release}|%{arch}|%{repoid}"
-    repoq = [repoquery, '--show-duplicates', '--plugins', '--quiet', '-q']
+    repoq = [repoquery, '--show-duplicates', '--plugins', '--quiet']
     if conf_file and os.path.exists(conf_file):
         repoq += ['-c', conf_file]
 
@@ -682,7 +677,7 @@ def latest(module, items, repoq, yum_basecmd, conf_file, en_repos, dis_repos):
                     nothing_to_do = False
                     break
                     
-                if basecmd == 'update' and is_update(module, repoq, this, conf_file, en_repos=en_repos, dis_repos=dis_repos):
+                if basecmd == 'update' and is_update(module, repoq, this, conf_file, en_repos=en_repos, dis_repos=en_repos):
                     nothing_to_do = False
                     break
                     
@@ -720,20 +715,16 @@ def latest(module, items, repoq, yum_basecmd, conf_file, en_repos, dis_repos):
 
     module.exit_json(**res)
 
-def ensure(module, state, pkgspec, conf_file, enablerepo, disablerepo,
+def ensure(module, state, pkgs, conf_file, enablerepo, disablerepo,
            disable_gpg_check):
-
-    # take multiple args comma separated
-    items = pkgspec.split(',')
 
     # need debug level 2 to get 'Nothing to do' for groupinstall.
     yum_basecmd = [yumbin, '-d', '2', '-y']
 
-        
     if not repoquery:
         repoq = None
     else:
-        repoq = [repoquery, '--show-duplicates', '--plugins', '--quiet', '-q']
+        repoq = [repoquery, '--show-duplicates', '--plugins', '--quiet']
 
     if conf_file and os.path.exists(conf_file):
         yum_basecmd += ['-c', conf_file]
@@ -744,16 +735,13 @@ def ensure(module, state, pkgspec, conf_file, enablerepo, disablerepo,
     en_repos = []
     if disablerepo:
         dis_repos = disablerepo.split(',')
+        r_cmd = ['--disablerepo=%s' % disablerepo]
+        yum_basecmd.extend(r_cmd)
     if enablerepo:
         en_repos = enablerepo.split(',')
-           
-    for repoid in dis_repos:
-        r_cmd = ['--disablerepo=%s' % repoid]
+        r_cmd = ['--enablerepo=%s' % enablerepo]
         yum_basecmd.extend(r_cmd)
 
-    for repoid in en_repos:
-        r_cmd = ['--enablerepo=%s' % repoid]
-        yum_basecmd.extend(r_cmd)
 
     if state in ['installed', 'present', 'latest']:
 
@@ -762,13 +750,12 @@ def ensure(module, state, pkgspec, conf_file, enablerepo, disablerepo,
 
         my = yum_base(conf_file)
         try:
-            for r in dis_repos:
-                my.repos.disableRepo(r)
-
+            if disablerepo:
+                my.repos.disableRepo(disablerepo)
             current_repos = my.repos.repos.keys()
-            for r in en_repos:
+            if enablerepo:
                 try:
-                    my.repos.enableRepo(r)
+                    my.repos.enableRepo(enablerepo)
                     new_repos = my.repos.repos.keys()
                     for i in new_repos:
                         if not i in current_repos:
@@ -776,20 +763,19 @@ def ensure(module, state, pkgspec, conf_file, enablerepo, disablerepo,
                             a = rid.repoXML.repoid
                     current_repos = new_repos
                 except yum.Errors.YumBaseError, e:
-                    module.fail_json(msg="Error setting/accessing repo %s: %s" % (r, e))
+                    module.fail_json(msg="Error setting/accessing repos: %s" % (e))
         except yum.Errors.YumBaseError, e:
             module.fail_json(msg="Error accessing repos: %s" % e)
-
     if state in ['installed', 'present']:
         if disable_gpg_check:
             yum_basecmd.append('--nogpgcheck')
-        install(module, items, repoq, yum_basecmd, conf_file, en_repos, dis_repos)
+        install(module, pkgs, repoq, yum_basecmd, conf_file, en_repos, dis_repos)
     elif state in ['removed', 'absent']:
-        remove(module, items, repoq, yum_basecmd, conf_file, en_repos, dis_repos)
+        remove(module, pkgs, repoq, yum_basecmd, conf_file, en_repos, dis_repos)
     elif state == 'latest':
         if disable_gpg_check:
             yum_basecmd.append('--nogpgcheck')
-        latest(module, items, repoq, yum_basecmd, conf_file, en_repos, dis_repos)
+        latest(module, pkgs, repoq, yum_basecmd, conf_file, en_repos, dis_repos)
 
     # should be caught by AnsibleModule argument_spec
     return dict(changed=False, failed=True, results='', errors='unexpected state')
@@ -809,7 +795,7 @@ def main():
 
     module = AnsibleModule(
         argument_spec = dict(
-            name=dict(aliases=['pkg']),
+            name=dict(aliases=['pkg'], type="list"),
             # removed==absent, installed==present, these are accepted as aliases
             state=dict(default='installed', choices=['absent','present','installed','removed','latest']),
             enablerepo=dict(),
@@ -838,7 +824,7 @@ def main():
         module.exit_json(**results)
 
     else:
-        pkg = params['name']
+        pkg = [ p.strip() for p in params['name']]
         state = params['state']
         enablerepo = params.get('enablerepo', '')
         disablerepo = params.get('disablerepo', '')

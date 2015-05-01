@@ -96,33 +96,12 @@ options:
     aliases: []
   region:
     description:
-      - region in which the resource exists.
-    required: false
+      - The AWS region to use. If not specified then the value of the AWS_REGION or EC2_REGION environment variable, if any, is used.
+    required: true
     default: null
     aliases: ['aws_region', 'ec2_region']
-  aws_secret_key:
-    description:
-      - AWS secret key. If not set then the value of the AWS_SECRET_KEY environment variable is used.
-    required: false
-    default: None
-    aliases: ['ec2_secret_key', 'secret_key' ]
-  aws_access_key:
-    description:
-      - AWS access key. If not set then the value of the AWS_ACCESS_KEY environment variable is used.
-    required: false
-    default: None
-    aliases: ['ec2_access_key', 'access_key' ]
-  validate_certs:
-    description:
-      - When set to "no", SSL certificates will not be validated for boto versions >= 2.6.0.
-    required: false
-    default: "yes"
-    choices: ["yes", "no"]
-    aliases: []
-    version_added: "1.5"
-
-requirements: [ "boto" ]
 author: Carson Gee
+extends_documentation_fragment: aws
 '''
 
 EXAMPLES = '''
@@ -177,16 +156,17 @@ the delete will fail until those dependencies are removed.
 '''
 
 
-import sys
 import time
 
 try:
     import boto.ec2
     import boto.vpc
     from boto.exception import EC2ResponseError
+
+    HAS_BOTO = True
 except ImportError:
-    print "failed=True msg='boto required for this module'"
-    sys.exit(1)
+    HAS_BOTO = False
+
 
 def get_vpc_info(vpc):
     """
@@ -506,6 +486,16 @@ def create_vpc(module, vpc_conn):
             'id': sn.id,
         })
 
+    if subnets is not None:
+        # Sort subnets by the order they were listed in the play
+        order = {}
+        for idx, val in enumerate(subnets):
+            order[val['cidr']] = idx
+
+        # Number of subnets in the play
+        subnets_in_play = len(subnets)
+        returned_subnets.sort(key=lambda x: order.get(x['cidr'], subnets_in_play))
+
     return (vpc_dict, created_vpc_id, returned_subnets, changed)
 
 def terminate_vpc(module, vpc_conn, vpc_id=None, cidr=None):
@@ -588,17 +578,19 @@ def main():
         argument_spec=argument_spec,
     )
 
+    if not HAS_BOTO:
+        module.fail_json(msg='boto required for this module')
+
     state = module.params.get('state')
 
-    ec2_url, aws_access_key, aws_secret_key, region = get_ec2_creds(module)
+    region, ec2_url, aws_connect_kwargs = get_aws_connection_info(module)
 
     # If we have a region specified, connect to its endpoint.
     if region:
         try:
             vpc_conn = boto.vpc.connect_to_region(
                 region,
-                aws_access_key_id=aws_access_key,
-                aws_secret_access_key=aws_secret_key
+                **aws_connect_kwargs
             )
         except boto.exception.NoAuthHandlerFound, e:
             module.fail_json(msg = str(e))

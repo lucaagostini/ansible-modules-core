@@ -122,9 +122,9 @@ try:
     import boto.ec2.cloudwatch
     from boto.ec2.cloudwatch import CloudWatchConnection, MetricAlarm
     from boto.exception import BotoServerError
+    HAS_BOTO = True
 except ImportError:
-    print "failed=True msg='boto required for this module'"
-    sys.exit(1)
+    HAS_BOTO = False
 
 
 def create_metric_alarm(connection, module):
@@ -190,7 +190,7 @@ def create_metric_alarm(connection, module):
         for keys in dim1:
             if not isinstance(dim1[keys], list):
                 dim1[keys] = [dim1[keys]]
-            if dim1[keys] != dim2[keys]:
+            if keys not in dim2 or dim1[keys] != dim2[keys]:
                 changed=True
                 setattr(alarm, 'dimensions', dim1)
 
@@ -260,18 +260,21 @@ def main():
             insufficient_data_actions=dict(type='list'),
             ok_actions=dict(type='list'),
             state=dict(default='present', choices=['present', 'absent']),
-            region=dict(aliases=['aws_region', 'ec2_region'], choices=AWS_REGIONS),
+            region=dict(aliases=['aws_region', 'ec2_region']),
            )
     )
 
     module = AnsibleModule(argument_spec=argument_spec)
+
+    if not HAS_BOTO:
+        module.fail_json(msg='boto required for this module')
 
     state = module.params.get('state')
 
     region, ec2_url, aws_connect_params = get_aws_connection_info(module)
     try:
         connection = connect_to_aws(boto.ec2.cloudwatch, region, **aws_connect_params)
-    except boto.exception.NoAuthHandlerFound, e:
+    except (boto.exception.NoAuthHandlerFound, StandardError), e:
         module.fail_json(msg=str(e))
 
     if state == 'present':

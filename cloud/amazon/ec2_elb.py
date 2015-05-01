@@ -99,17 +99,16 @@ post_tasks:
 """
 
 import time
-import sys
-import os
 
 try:
     import boto
     import boto.ec2
     import boto.ec2.elb
     from boto.regioninfo import RegionInfo
+    HAS_BOTO = True
 except ImportError:
-    print "failed=True msg='boto required for this module'"
-    sys.exit(1)
+    HAS_BOTO = False
+
 
 class ElbManager:
     """Handles EC2 instance ELB registration and de-registration"""
@@ -258,7 +257,7 @@ class ElbManager:
         try:
             elb = connect_to_aws(boto.ec2.elb, self.region, 
                                  **self.aws_connect_params)
-        except boto.exception.NoAuthHandlerFound, e:
+        except (boto.exception.NoAuthHandlerFound, StandardError), e:
             self.module.fail_json(msg=str(e))
 
         elbs = elb.get_all_load_balancers()
@@ -278,7 +277,7 @@ class ElbManager:
         try:
             ec2 = connect_to_aws(boto.ec2, self.region, 
                                  **self.aws_connect_params)
-        except boto.exception.NoAuthHandlerFound, e:
+        except (boto.exception.NoAuthHandlerFound, StandardError), e:
             self.module.fail_json(msg=str(e))
         return ec2.get_only_instances(instance_ids=[self.instance_id])[0]
 
@@ -298,6 +297,9 @@ def main():
     module = AnsibleModule(
         argument_spec=argument_spec,
     )
+
+    if not HAS_BOTO:
+        module.fail_json(msg='boto required for this module')
 
     region, ec2_url, aws_connect_params = get_aws_connection_info(module)
 

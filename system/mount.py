@@ -51,14 +51,14 @@ options:
     default: null
   dump:
     description:
-      - dump (see fstab(8))
+      - "dump (see fstab(8)), Note that if nulled, C(state=present) will cease to work and duplicate entries will be made with subsequent runs."
     required: false
-    default: null
+    default: 0
   passno:
     description:
-      - passno (see fstab(8))
+      - "passno (see fstab(8)), Note that if nulled, C(state=present) will cease to work and duplicate entries will be made with subsequent runs."
     required: false
-    default: null
+    default: 0
   state:
     description:
       - If C(mounted) or C(unmounted), the device will be actively mounted or unmounted
@@ -318,6 +318,17 @@ def main():
         if state == 'mounted':
             res = 0
             if os.path.ismount(name):
+                if changed:
+                    res,msg = mount(module, **args)
+            elif 'bind' in args.get('opts', []):
+                changed = True
+                cmd = 'mount -l'
+                rc, out, err = module.run_command(cmd)
+                allmounts = out.split('\n')
+                for mounts in allmounts[:-1]:
+                    arguments = mounts.split()
+                    if arguments[0] == args['src'] and arguments[2] == args['name'] and arguments[4] == args['fstype']:
+                        changed = False
                 if changed:
                     res,msg = mount(module, **args)
             else:

@@ -30,7 +30,6 @@ options:
     description:
       - name of the user (role) to add or remove
     required: true
-    default: null
   password:
     description:
       - set the user's password
@@ -93,6 +92,19 @@ options:
     required: false
     default: false
     version_added: "1.3"
+  update_password:
+    required: false
+    default: always
+    choices: ['always', 'on_create']
+    version_added: "2.0"
+    description:
+      - C(always) will update passwords if they differ.  C(on_create) will only set the password for newly created users.
+  config_file:
+    description:
+      - Specify a config file from which user and password are to be read
+    required: false
+    default: '~/.my.cnf'
+    version_added: "2.0"
 notes:
    - Requires the MySQLdb Python package on the remote host. For Ubuntu, this
      is as easy as apt-get install python-mysqldb.
@@ -106,7 +118,7 @@ notes:
      the new root credentials. Subsequent runs of the playbook will then succeed by reading the new credentials from
      the file."
 
-requirements: [ "ConfigParser", "MySQLdb" ]
+requirements: [ "MySQLdb" ]
 author: Mark Theunissen
 '''
 
@@ -116,6 +128,9 @@ EXAMPLES = """
 
 # Creates database user 'bob' and password '12345' with all database privileges and 'WITH GRANT OPTION'
 - mysql_user: name=bob password=12345 priv=*.*:ALL,GRANT state=present
+
+# Modifiy user Bob to require SSL connections. Note that REQUIRESSL is a special privilege that should only apply to *.* by itself.
+- mysql_user: name=bob append_privs=true priv=*.*:REQUIRESSL state=present
 
 # Ensure no user named 'sally' exists, also passing in the auth credentials.
 - mysql_user: login_user=root login_password=123456 name=sally state=absent
@@ -141,7 +156,6 @@ user=root
 password=n<_665{vS43y
 """
 
-import ConfigParser
 import getpass
 import tempfile
 try:
@@ -159,7 +173,7 @@ VALID_PRIVS = frozenset(('CREATE', 'DROP', 'GRANT', 'GRANT OPTION',
                          'EXECUTE', 'FILE', 'CREATE TABLESPACE', 'CREATE USER',
                          'PROCESS', 'PROXY', 'RELOAD', 'REPLICATION CLIENT',
                          'REPLICATION SLAVE', 'SHOW DATABASES', 'SHUTDOWN',
-                         'SUPER', 'ALL', 'ALL PRIVILEGES', 'USAGE',))
+                         'SUPER', 'ALL', 'ALL PRIVILEGES', 'USAGE', 'REQUIRESSL'))
 
 class InvalidPrivsError(Exception):
     pass
@@ -167,6 +181,30 @@ class InvalidPrivsError(Exception):
 # ===========================================
 # MySQL module specific support methods.
 #
+
+def connect(module, login_user=None, login_password=None, config_file='~/.my.cnf'):
+    config = {
+        'host': module.params['login_host'],
+        'db': 'mysql'
+    }
+
+    if module.params['login_unix_socket']:
+        config['unix_socket'] = module.params['login_unix_socket']
+    else:
+        config['port'] = module.params['login_port']
+
+    if os.path.exists(config_file):
+        config['read_default_file'] = config_file
+
+    # If login_user or login_password are given, they should override the
+    # config file
+    if login_user is not None:
+        config['user'] = login_user
+    if login_password is not None:
+        config['passwd'] = login_password
+
+    db_connection = MySQLdb.connect(**config)
+    return db_connection.cursor()
 
 def user_exists(cursor, user, host):
     cursor.execute("SELECT count(*) FROM user WHERE user = %s AND host = %s", (user,host))
@@ -261,6 +299,8 @@ def privileges_get(cursor, user,host):
         privileges = [ pick(x) for x in privileges]
         if "WITH GRANT OPTION" in res.group(4):
             privileges.append('GRANT')
+        if "REQUIRE SSL" in res.group(4):
+            privileges.append('REQUIRESSL')
         db = res.group(2)
         output[db] = privileges
     return output
@@ -294,6 +334,11 @@ def privileges_unpack(priv):
     if '*.*' not in output:
         output['*.*'] = ['USAGE']
 
+    # if we are only specifying something like REQUIRESSL in *.* we still need
+    # to add USAGE as a privilege to avoid syntax errors
+    if priv.find('REQUIRESSL') != -1 and 'USAGE' not in output['*.*']:
+        output['*.*'].append('USAGE')
+
     return output
 
 def privileges_revoke(cursor, user,host,db_table,grant_option):
@@ -313,108 +358,15 @@ def privileges_grant(cursor, user,host,db_table,priv):
     # Escape '%' since mysql db.execute uses a format string and the
     # specification of db and table often use a % (SQL wildcard)
     db_table = db_table.replace('%', '%%')
-    priv_string = ",".join(filter(lambda x: x != 'GRANT', priv))
+    priv_string = ",".join(filter(lambda x: x not in [ 'GRANT', 'REQUIRESSL' ], priv))
     query = ["GRANT %s ON %s" % (priv_string, mysql_quote_identifier(db_table, 'table'))]
     query.append("TO %s@%s")
     if 'GRANT' in priv:
         query.append("WITH GRANT OPTION")
+    if 'REQUIRESSL' in priv:
+        query.append("REQUIRE SSL")
     query = ' '.join(query)
     cursor.execute(query, (user, host))
-
-
-def strip_quotes(s):
-    """ Remove surrounding single or double quotes
-
-    >>> print strip_quotes('hello')
-    hello
-    >>> print strip_quotes('"hello"')
-    hello
-    >>> print strip_quotes("'hello'")
-    hello
-    >>> print strip_quotes("'hello")
-    'hello
-
-    """
-    single_quote = "'"
-    double_quote = '"'
-
-    if s.startswith(single_quote) and s.endswith(single_quote):
-        s = s.strip(single_quote)
-    elif s.startswith(double_quote) and s.endswith(double_quote):
-        s = s.strip(double_quote)
-    return s
-
-
-def config_get(config, section, option):
-    """ Calls ConfigParser.get and strips quotes
-
-    See: http://dev.mysql.com/doc/refman/5.0/en/option-files.html
-    """
-    return strip_quotes(config.get(section, option))
-
-
-def _safe_cnf_load(config, path):
-
-    data = {'user':'', 'password':''}
-
-    # read in user/pass
-    f = open(path, 'r')
-    for line in f.readlines():
-        line = line.strip()
-        if line.startswith('user='):
-            data['user'] = line.split('=', 1)[1].strip()
-        if line.startswith('password=') or line.startswith('pass='):
-            data['password'] = line.split('=', 1)[1].strip()
-    f.close()
-
-    # write out a new cnf file with only user/pass   
-    fh, newpath = tempfile.mkstemp(prefix=path + '.')
-    f = open(newpath, 'wb')
-    f.write('[client]\n')
-    f.write('user=%s\n' % data['user'])
-    f.write('password=%s\n' % data['password'])
-    f.close()
-
-    config.readfp(open(newpath))
-    os.remove(newpath)
-    return config
-
-def load_mycnf():
-    config = ConfigParser.RawConfigParser()
-    mycnf = os.path.expanduser('~/.my.cnf')
-    if not os.path.exists(mycnf):
-        return False
-    try:
-        config.readfp(open(mycnf))
-    except (IOError):
-        return False
-    except:
-        config = _safe_cnf_load(config, mycnf)
-
-    # We support two forms of passwords in .my.cnf, both pass= and password=,
-    # as these are both supported by MySQL.
-    try:
-        passwd = config_get(config, 'client', 'password')
-    except (ConfigParser.NoOptionError):
-        try:
-            passwd = config_get(config, 'client', 'pass')
-        except (ConfigParser.NoOptionError):
-            return False
-
-    # If .my.cnf doesn't specify a user, default to user login name
-    try:
-        user = config_get(config, 'client', 'user')
-    except (ConfigParser.NoOptionError):
-        user = getpass.getuser()
-    creds = dict(user=user,passwd=passwd)
-    return creds
-
-def connect(module, login_user, login_password):
-    if module.params["login_unix_socket"]:
-        db_connection = MySQLdb.connect(host=module.params["login_host"], unix_socket=module.params["login_unix_socket"], user=login_user, passwd=login_password, db="mysql")
-    else:
-        db_connection = MySQLdb.connect(host=module.params["login_host"], port=int(module.params["login_port"]), user=login_user, passwd=login_password, db="mysql")
-    return db_connection.cursor()
 
 # ===========================================
 # Module execution.
@@ -426,7 +378,7 @@ def main():
             login_user=dict(default=None),
             login_password=dict(default=None),
             login_host=dict(default="localhost"),
-            login_port=dict(default="3306"),
+            login_port=dict(default=3306, type='int'),
             login_unix_socket=dict(default=None),
             user=dict(required=True, aliases=['name']),
             password=dict(default=None),
@@ -435,15 +387,21 @@ def main():
             priv=dict(default=None),
             append_privs=dict(type="bool", default="no"),
             check_implicit_admin=dict(default=False),
+            update_password=dict(default="always", choices=["always", "on_create"]),
+            config_file=dict(default="~/.my.cnf"),
         )
     )
+    login_user = module.params["login_user"]
+    login_password = module.params["login_password"]
     user = module.params["user"]
     password = module.params["password"]
     host = module.params["host"]
     state = module.params["state"]
     priv = module.params["priv"]
     check_implicit_admin = module.params['check_implicit_admin']
+    config_file = module.params['config_file']
     append_privs = module.boolean(module.params["append_privs"])
+    update_password = module.params['update_password']
 
     if not mysqldb_found:
         module.fail_json(msg="the python mysqldb module is required")
@@ -454,49 +412,35 @@ def main():
         except Exception, e:
             module.fail_json(msg="invalid privileges string: %s" % str(e))
 
-    # Either the caller passes both a username and password with which to connect to
-    # mysql, or they pass neither and allow this module to read the credentials from
-    # ~/.my.cnf.
-    login_password = module.params["login_password"]
-    login_user = module.params["login_user"]
-    if login_user is None and login_password is None:
-        mycnf_creds = load_mycnf()
-        if mycnf_creds is False:
-            login_user = "root"
-            login_password = ""
-        else:
-            login_user = mycnf_creds["user"]
-            login_password = mycnf_creds["passwd"]
-    elif login_password is None or login_user is None:
-        module.fail_json(msg="when supplying login arguments, both login_user and login_password must be provided")
-
     cursor = None
     try:
         if check_implicit_admin:
             try:
-                cursor = connect(module, 'root', '')
+                cursor = connect(module, 'root', '', config_file)
             except:
                 pass
 
         if not cursor:
-            cursor = connect(module, login_user, login_password)
+            cursor = connect(module, login_user, login_password, config_file)
     except Exception, e:
         module.fail_json(msg="unable to connect to database, check login_user and login_password are correct or ~/.my.cnf has the credentials")
 
     if state == "present":
         if user_exists(cursor, user, host):
             try:
-                changed = user_mod(cursor, user, host, password, priv, append_privs)
-            except SQLParseError, e:
-                module.fail_json(msg=str(e))
-            except InvalidPrivsError, e:
+                if update_password == 'always':
+                    changed = user_mod(cursor, user, host, password, priv, append_privs)
+                else:
+                    changed = user_mod(cursor, user, host, None, priv, append_privs)
+
+            except (SQLParseError, InvalidPrivsError, MySQLdb.Error), e:
                 module.fail_json(msg=str(e))
         else:
             if password is None:
                 module.fail_json(msg="password parameter required when adding a user")
             try:
                 changed = user_add(cursor, user, host, password, priv)
-            except SQLParseError, e:
+            except (SQLParseError, InvalidPrivsError, MySQLdb.Error), e:
                 module.fail_json(msg=str(e))
     elif state == "absent":
         if user_exists(cursor, user, host):

@@ -33,7 +33,7 @@ description:
 options:
   allowed:
     description:
-      - the protocol:ports to allow ('tcp:80' or 'tcp:80,443' or 'tcp:80-800')
+      - the protocol:ports to allow ('tcp:80' or 'tcp:80,443' or 'tcp:80-800;udp:1-25')
     required: false
     default: null
     aliases: []
@@ -63,6 +63,13 @@ options:
   src_tags:
     description:
       - the source instance tags for creating a firewall rule
+    required: false
+    default: null
+    aliases: []
+  target_tags:
+    version_added: "1.9"
+    description:
+      - the target instance tags for creating a firewall rule
     required: false
     default: null
     aliases: []
@@ -129,9 +136,8 @@ except ImportError:
             "msg='libcloud with GCE support required for this module.'")
     sys.exit(1)
 
-
-def format_allowed(allowed):
-    """Format the 'allowed' value so that it is GCE compatible."""
+def format_allowed_section(allowed):
+    """Format each section of the allowed list"""
     if allowed.count(":") == 0:
         protocol = allowed
         ports = []
@@ -146,8 +152,18 @@ def format_allowed(allowed):
     return_val = {"IPProtocol": protocol}
     if ports:
         return_val["ports"] = ports
-    return [return_val]
+    return return_val
 
+def format_allowed(allowed):
+    """Format the 'allowed' value so that it is GCE compatible."""
+    return_value = []
+    if allowed.count(";") == 0:
+        return [format_allowed_section(allowed)]
+    else:
+        sections = allowed.split(";")
+        for section in sections:
+            return_value.append(format_allowed_section(section))
+    return return_value
 
 def main():
     module = AnsibleModule(
@@ -156,8 +172,9 @@ def main():
             ipv4_range = dict(),
             fwname = dict(),
             name = dict(),
-            src_range = dict(),
+            src_range = dict(type='list'),
             src_tags = dict(type='list'),
+            target_tags = dict(type='list'),
             state = dict(default='present'),
             service_account_email = dict(),
             pem_file = dict(),
@@ -173,6 +190,7 @@ def main():
     name = module.params.get('name')
     src_range = module.params.get('src_range')
     src_tags = module.params.get('src_tags')
+    target_tags = module.params.get('target_tags')
     state = module.params.get('state')
 
     changed = False
@@ -218,7 +236,7 @@ def main():
 
             try:
                 gce.ex_create_firewall(fwname, allowed_list, network=name,
-                        source_ranges=src_range, source_tags=src_tags)
+                        source_ranges=src_range, source_tags=src_tags, target_tags=target_tags)
                 changed = True
             except ResourceExistsError:
                 pass
@@ -229,6 +247,7 @@ def main():
             json_output['allowed'] = allowed
             json_output['src_range'] = src_range
             json_output['src_tags'] = src_tags
+            json_output['target_tags'] = target_tags
 
     if state in ['absent', 'deleted']:
         if fwname:

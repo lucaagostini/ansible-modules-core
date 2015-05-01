@@ -13,7 +13,6 @@
 #
 # You should have received a copy of the GNU General Public License
 # along with Ansible.  If not, see <http://www.gnu.org/licenses/>.
-
 DOCUMENTATION = """
 ---
 module: ec2_asg
@@ -115,6 +114,12 @@ options:
       - how long before wait instances to become viable when replaced.  Used in concjunction with instance_ids option.
     default: 300
     version_added: "1.8"
+  wait_for_instances:
+    description:
+      - Wait for the ASG instances to be in a ready state before exiting.  If instances are behind an ELB, it will wait until the ELB determines all instances have a lifecycle_state of  "InService" and  a health_status of "Healthy".
+    version_added: "1.9"
+    default: yes
+    required: False
 extends_documentation_fragment: aws
 """
 
@@ -184,7 +189,6 @@ to "replace_instances":
     region: us-east-1
 '''
 
-import sys
 import time
 
 from ansible.module_utils.basic import *
@@ -194,9 +198,9 @@ try:
     import boto.ec2.autoscale
     from boto.ec2.autoscale import AutoScaleConnection, AutoScalingGroup, Tag
     from boto.exception import BotoServerError
+    HAS_BOTO = True
 except ImportError:
-    print "failed=True msg='boto required for this module'"
-    sys.exit(1)
+    HAS_BOTO = False
 
 ASG_ATTRIBUTES = ('availability_zones', 'default_cooldown', 'desired_capacity',
     'health_check_period', 'health_check_type', 'launch_config_name',
@@ -219,6 +223,16 @@ def enforce_required_arguments(module):
 
 def get_properties(autoscaling_group):
     properties = dict((attr, getattr(autoscaling_group, attr)) for attr in ASG_ATTRIBUTES)
+
+    # Ugly hack to make this JSON-serializable.  We take a list of boto Tag
+    # objects and replace them with a dict-representation.  Needed because the
+    # tags are included in ansible's return value (which is jsonified)
+    if 'tags' in properties and isinstance(properties['tags'], list):
+        serializable_tags = {}
+        for tag in properties['tags']:
+            serializable_tags[tag.key] = [tag.value, tag.propagate_at_launch]
+        properties['tags'] = serializable_tags
+
     properties['healthy_instances'] = 0
     properties['in_service_instances'] = 0
     properties['unhealthy_instances'] = 0
@@ -254,8 +268,47 @@ def get_properties(autoscaling_group):
     return properties
 
 
-def create_autoscaling_group(connection, module):
+def wait_for_elb(asg_connection, module, group_name):
+    region, ec2_url, aws_connect_params = get_aws_connection_info(module)
+    wait_timeout = module.params.get('wait_timeout')
 
+    # if the health_check_type is ELB, we want to query the ELBs directly for instance
+    # status as to avoid health_check_grace period that is awarded to ASG instances
+    as_group = asg_connection.get_all_groups(names=[group_name])[0]
+
+    if as_group.load_balancers and as_group.health_check_type == 'ELB':
+        try:
+            elb_connection = connect_to_aws(boto.ec2.elb, region, **aws_connect_params)
+        except boto.exception.NoAuthHandlerFound, e:
+            module.fail_json(msg=str(e))
+
+        wait_timeout = time.time() + wait_timeout
+        healthy_instances = {}
+
+        while len(healthy_instances.keys()) < as_group.min_size and wait_timeout > time.time():
+            as_group = asg_connection.get_all_groups(names=[group_name])[0]
+            props = get_properties(as_group)
+            # get healthy, inservice instances from ASG
+            instances = []
+            for instance, settings in props['instance_facts'].items():
+                if settings['lifecycle_state'] == 'InService' and settings['health_status'] == 'Healthy':
+                    instances.append(instance)
+            for lb in as_group.load_balancers:
+                # we catch a race condition that sometimes happens if the instance exists in the ASG
+                # but has not yet show up in the ELB
+                try:
+                    lb_instances = elb_connection.describe_instance_health(lb, instances=instances)
+                except boto.exception.InvalidInstance, e:
+                    pass
+                for i in lb_instances:
+                    if i.state == "InService":
+                        healthy_instances[i.instance_id] = i.state
+            time.sleep(10)
+        if wait_timeout <= time.time():
+        # waiting took too long
+            module.fail_json(msg = "Waited too long for ELB instances to be healthy. %s" % time.asctime())
+
+def create_autoscaling_group(connection, module):
     group_name = module.params.get('name')
     load_balancers = module.params['load_balancers']
     availability_zones = module.params['availability_zones']
@@ -267,32 +320,27 @@ def create_autoscaling_group(connection, module):
     set_tags = module.params.get('tags')
     health_check_period = module.params.get('health_check_period')
     health_check_type = module.params.get('health_check_type')
-    
+    wait_for_instances = module.params.get('wait_for_instances')
     as_groups = connection.get_all_groups(names=[group_name])
+    wait_timeout = module.params.get('wait_timeout')
 
     if not vpc_zone_identifier and not availability_zones:
         region, ec2_url, aws_connect_params = get_aws_connection_info(module)
         try:
             ec2_connection = connect_to_aws(boto.ec2, region, **aws_connect_params)
-        except boto.exception.NoAuthHandlerFound, e:
+        except (boto.exception.NoAuthHandlerFound, StandardError), e:
             module.fail_json(msg=str(e))
     elif vpc_zone_identifier:
         vpc_zone_identifier = ','.join(vpc_zone_identifier)
 
     asg_tags = []
     for tag in set_tags:
-        if tag.has_key('key') and tag.has_key('value'):  # this block is to support depricated form
-            asg_tags.append(Tag(key=tag.get('key'),
-                value=tag.get('value'),
-                propagate_at_launch=bool(tag.get('propagate_at_launch', True)),
-                resource_id=group_name))
-        else:
-            for k,v in tag.iteritems():
-                if k !='propagate_at_launch':
-                    asg_tags.append(Tag(key=k,
-                         value=v,
-                         propagate_at_launch=bool(tag.get('propagate_at_launch', True)),
-                         resource_id=group_name))
+        for k,v in tag.iteritems():
+            if k !='propagate_at_launch':
+                asg_tags.append(Tag(key=k,
+                     value=v,
+                     propagate_at_launch=bool(tag.get('propagate_at_launch', True)),
+                     resource_id=group_name))
 
     if not as_groups:
         if not vpc_zone_identifier and not availability_zones:
@@ -315,7 +363,11 @@ def create_autoscaling_group(connection, module):
 
         try:
             connection.create_auto_scaling_group(ag)
-            asg_properties = get_properties(ag)
+            if wait_for_instances == True:
+                wait_for_new_instances(module, connection, group_name, wait_timeout, desired_capacity, 'viable_instances')
+                wait_for_elb(connection, module, group_name)
+            as_group = connection.get_all_groups(names=[group_name])[0]
+            asg_properties = get_properties(as_group)
             changed = True
             return(changed, asg_properties)
         except BotoServerError, e:
@@ -324,8 +376,10 @@ def create_autoscaling_group(connection, module):
         as_group = as_groups[0]
         changed = False
         for attr in ASG_ATTRIBUTES:
-            if module.params.get(attr):
+            if module.params.get(attr, None) is not None:
                 module_attr = module.params.get(attr)
+                if attr == 'vpc_zone_identifier':
+                    module_attr = ','.join(module_attr)
                 group_attr = getattr(as_group, attr)
                 # we do this because AWS and the module may return the same list
                 # sorted differently
@@ -342,30 +396,25 @@ def create_autoscaling_group(connection, module):
                     setattr(as_group, attr, module_attr)
 
         if len(set_tags) > 0:
-            existing_tags = as_group.tags
-            existing_tag_map = dict((tag.key, tag) for tag in existing_tags)
-            for tag in set_tags:
-                if tag.has_key('key') and tag.has_key('value'):  # this is to support deprecated method
-                    if 'key' not in tag:
-                        continue
-                    if ( not tag['key'] in existing_tag_map or
-                        existing_tag_map[tag['key']].value != tag['value'] or
-                        ('propagate_at_launch' in tag and
-                        existing_tag_map[tag['key']].propagate_at_launch != tag['propagate_at_launch']) ):
-                        changed = True
-                        continue
-                else:
-                    for k,v in tag.iteritems():
-                        if k !='propagate_at_launch':
-                            if ( not k in existing_tag_map or
-                                existing_tag_map[k].value != v or
-                                ('propagate_at_launch' in tag and
-                                existing_tag_map[k].propagate_at_launch != tag['propagate_at_launch']) ):
-                                changed = True
-                                continue
-            if changed:
+            have_tags = {}
+            want_tags = {}
+
+            for tag in asg_tags:
+                want_tags[tag.key] = [tag.value, tag.propagate_at_launch]
+
+            dead_tags = []
+            for tag in as_group.tags:
+                have_tags[tag.key] = [tag.value, tag.propagate_at_launch]
+                if not tag.key in want_tags:
+                    changed = True
+                    dead_tags.append(tag)
+
+            if dead_tags != []:
+                connection.delete_tags(dead_tags)
+
+            if have_tags != want_tags:
+                changed = True
                 connection.create_or_update_tags(asg_tags)
-                as_group.tags = asg_tags
 
         # handle loadbalancers separately because None != []
         load_balancers = module.params.get('load_balancers') or []
@@ -373,13 +422,22 @@ def create_autoscaling_group(connection, module):
             changed = True
             as_group.load_balancers = module.params.get('load_balancers')
 
-        try:
-            if changed:
+
+        if changed:
+            try:
                 as_group.update()
+            except BotoServerError, e:
+                module.fail_json(msg=str(e))
+
+        if wait_for_instances == True:
+            wait_for_new_instances(module, connection, group_name, wait_timeout, desired_capacity, 'viable_instances')
+            wait_for_elb(connection, module, group_name)
+        try:
+            as_group = connection.get_all_groups(names=[group_name])[0]
             asg_properties = get_properties(as_group)
-            return(changed, asg_properties)
         except BotoServerError, e:
             module.fail_json(msg=str(e))
+        return(changed, asg_properties)
 
 
 def delete_autoscaling_group(connection, module):
@@ -401,6 +459,8 @@ def delete_autoscaling_group(connection, module):
             time.sleep(10)
 
         group.delete()
+        while len(connection.get_all_groups(names=[group_name])):
+            time.sleep(5)
         changed=True
         return changed
     else:
@@ -412,7 +472,6 @@ def get_chunks(l, n):
         yield l[i:i+n]
 
 def replace(connection, module):
-
     batch_size = module.params.get('replace_batch_size')
     wait_timeout = module.params.get('wait_timeout')
     group_name = module.params.get('name')
@@ -422,20 +481,11 @@ def replace(connection, module):
 
     # FIXME: we need some more docs about this feature
     replace_instances = module.params.get('replace_instances')
-    
-    # wait for instance list to be populated on a newly provisioned ASG
-    instance_wait = time.time() + 30
-    while instance_wait > time.time():
-        as_group = connection.get_all_groups(names=[group_name])[0]
-        props = get_properties(as_group)
-        if props.has_key('instances'):
-            instances = props['instances']
-            break
-        time.sleep(10)
-    if instance_wait <= time.time():
-        # waiting took too long
-        module.fail_json(msg = "Waited too long for instances to appear. %s" % time.asctime())
-    # determine if we need to continue
+
+    as_group = connection.get_all_groups(names=[group_name])[0]
+    wait_for_new_instances(module, connection, group_name, wait_timeout, as_group.min_size, 'viable_instances')
+    props = get_properties(as_group)
+    instances = props['instances']
     replaceable = 0
     if replace_instances:
         instances = replace_instances
@@ -448,26 +498,24 @@ def replace(connection, module):
         return(changed, props)
         
     # set temporary settings and wait for them to be reached
+    as_group = connection.get_all_groups(names=[group_name])[0]
     as_group.max_size = max_size + batch_size
     as_group.min_size = min_size + batch_size
     as_group.desired_capacity = desired_capacity + batch_size
     as_group.update()
-    wait_timeout = time.time() + wait_timeout
-    while wait_timeout > time.time() and min_size + batch_size > props['viable_instances']:
-        time.sleep(10)
-        as_groups = connection.get_all_groups(names=[group_name])
-        as_group = as_groups[0]
-        props = get_properties(as_group)
-    if wait_timeout <= time.time():
-        # waiting took too long
-        module.fail_json(msg = "Waited too long for instances to appear. %s" % time.asctime())
+    wait_for_new_instances(module, connection, group_name, wait_timeout, as_group.min_size, 'viable_instances')
+    wait_for_elb(connection, module, group_name)
+    as_group = connection.get_all_groups(names=[group_name])[0]
+    props = get_properties(as_group)
     instances = props['instances']
     if replace_instances:
         instances = replace_instances
     for i in get_chunks(instances, batch_size):
-        replace_batch(connection, module, i)
+        terminate_batch(connection, module, i)
+        wait_for_new_instances(module, connection, group_name, wait_timeout, as_group.min_size, 'viable_instances')
+        wait_for_elb(connection, module, group_name)
+        as_group = connection.get_all_groups(names=[group_name])[0]
     # return settings to normal
-    as_group = connection.get_all_groups(names=[group_name])[0]
     as_group.max_size = max_size 
     as_group.min_size = min_size 
     as_group.desired_capacity = desired_capacity
@@ -477,9 +525,7 @@ def replace(connection, module):
     changed=True
     return(changed, asg_properties)
 
-def replace_batch(connection, module, replace_instances):
-    
-    
+def terminate_batch(connection, module, replace_instances):
     group_name = module.params.get('name')
     wait_timeout = int(module.params.get('wait_timeout'))
     lc_check = module.params.get('lc_check')
@@ -524,27 +570,22 @@ def replace_batch(connection, module, replace_instances):
         # waiting took too long
         module.fail_json(msg = "Waited too long for old instances to terminate. %s" % time.asctime())
 
+def wait_for_new_instances(module, connection, group_name, wait_timeout, desired_size, prop):
+
     # make sure we have the latest stats after that last loop.
     as_group = connection.get_all_groups(names=[group_name])[0]
     props = get_properties(as_group)
-
     # now we make sure that we have enough instances in a viable state
     wait_timeout = time.time() + wait_timeout
-    while wait_timeout > time.time() and props['min_size'] > props['viable_instances']:
+    while wait_timeout > time.time() and desired_size > props[prop]:
         time.sleep(10)
-        as_groups = connection.get_all_groups(names=[group_name])
-        as_group = as_groups[0]
+        as_group = connection.get_all_groups(names=[group_name])[0]
         props = get_properties(as_group)
-
     if wait_timeout <= time.time():
         # waiting took too long
         module.fail_json(msg = "Waited too long for new instances to become viable. %s" % time.asctime())
 
-    # collect final stats info
-    as_group = connection.get_all_groups(names=[group_name])[0]
-    asg_properties = get_properties(as_group)
-
-
+    return props
 
 def main():
     argument_spec = ec2_argument_spec()
@@ -567,6 +608,7 @@ def main():
             tags=dict(type='list', default=[]),
             health_check_period=dict(type='int', default=300),
             health_check_type=dict(default='EC2', choices=['EC2', 'ELB']),
+            wait_for_instances=dict(type='bool', default=True)
         ),
     )
     
@@ -574,6 +616,9 @@ def main():
         argument_spec=argument_spec, 
         mutually_exclusive = [['replace_all_instances', 'replace_instances']]
     )
+
+    if not HAS_BOTO:
+        module.fail_json(msg='boto required for this module')
 
     state = module.params.get('state')
     replace_instances = module.params.get('replace_instances')
@@ -586,7 +631,6 @@ def main():
     except boto.exception.NoAuthHandlerFound, e:
         module.fail_json(msg=str(e))
     changed = create_changed = replace_changed = False
-    
 
     if state == 'present':
         create_changed, asg_properties=create_autoscaling_group(connection, module)
@@ -598,5 +642,6 @@ def main():
     if create_changed or replace_changed:
         changed = True
     module.exit_json( changed = changed, **asg_properties )
+
 
 main()
