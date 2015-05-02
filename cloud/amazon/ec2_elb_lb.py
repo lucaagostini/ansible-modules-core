@@ -26,7 +26,7 @@ author: Jim Dalton
 options:
   state:
     description:
-      - Create or destroy the ELB
+      - Create, destroy or get fact of the ELB
     required: true
   name:
     description:
@@ -629,7 +629,7 @@ class ElbManager(object):
 def main():
     argument_spec = ec2_argument_spec()
     argument_spec.update(dict(
-            state={'required': True, 'choices': ['present', 'absent']},
+            state={'required': True, 'choices': ['present', 'absent', 'facts']},
             name={'required': True},
             listeners={'default': None, 'required': False, 'type': 'list'},
             purge_listeners={'default': True, 'required': False, 'type': 'bool'},
@@ -689,6 +689,11 @@ def main():
     if connection_draining_timeout and not elb_man._check_attribute_support('connection_draining'):
         module.fail_json(msg="You must install boto >= 2.28.0 to use the connection_draining_timeout attribute")
 
+    elb_info = None
+    if state == 'facts':
+        elb_info = elb_man.get_info()
+        if elb_info['status'] == "gone":
+            module.fail_json(msg="ELB %s does not exist" % name)
     if state == 'present':
         elb_man.ensure_ok()
     elif state == 'absent':
@@ -696,7 +701,7 @@ def main():
 
     ansible_facts = {'ec2_elb': 'info'}
     ec2_facts_result = dict(changed=elb_man.changed,
-                            elb=elb_man.get_info(),
+                            elb=elb_man.get_info() if elb_info is None else elb_info,
                             ansible_facts=ansible_facts)
 
     module.exit_json(**ec2_facts_result)
