@@ -26,7 +26,7 @@ author: Jim Dalton
 options:
   state:
     description:
-      - Create, destroy or get fact of the ELB
+      - Create, destroy or get facts from an ELB
     required: true
   name:
     description:
@@ -238,6 +238,12 @@ EXAMPLES = """
       - protocol: http
         load_balancer_port: 80
         instance_port: 80
+
+# Getting facts from an existing ELB
+- local_action:
+    module: ec2_elb_lb
+    name: "test-please-delete"
+    state: facts
 """
 
 try:
